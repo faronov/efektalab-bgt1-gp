@@ -1,0 +1,631 @@
+/* SPDX-License-Identifier: BSD-3-Clause
+ * Copyright (c) 2026, cc2530-zigbee contributors. See LICENSE.
+ */
+/* EfektaLab BGT1 Green Power Device. No Zigbee join, no stack runtime
+ * (only the cc2530-zigbee clock, Sleep Timer and AES helpers): GPDFs
+ * (include/gpd_frame.h, unidirectional commissioning) on one channel.
+ *
+ * Security (GPD_SECURITY, default): SecurityLevel 3 with an individual key,
+ * generated from radio noise on the first commissioning and kept in flash
+ * until a decommissioning or a chip erase. The Commissioning GPDF carries
+ * it protected with the default TC link key, as the ZHA (zigpy) and
+ * Zigbee2MQTT (zigbee-herdsman) sinks expect; every other GPDF but the
+ * Channel Requests is encrypted and authenticated with it. The security
+ * frame counter never repeats: flash holds a lease of 1024 counters, taken
+ * before its first counter is used, and a restart continues after it.
+ *
+ * Channel: with no saved channel (first start), a changed sensor set or a
+ * 3-s button press the device commissions: each of up to
+ * GPD_COMMISSION_ROUNDS rounds (GPD_COMMISSION_PERIOD apart) first searches
+ * the channel with GP Channel Requests (A.3.9.1: Auto-Commissioning 1 on
+ * every channel, then 0 on the hint channel and a receive window there; a
+ * GP proxy of the network, acting as TempMaster while the sink's
+ * commissioning window, ZHA permit join, is open, answers with a Channel
+ * Configuration on the hint channel). An answer ends the rounds: one
+ * Commissioning GPDF and a report on that channel, which is saved in flash
+ * (settings.h). Without an answer (no proxy, or permit join still closed)
+ * the round sends them on the hint channel (the saved one or GPD_CHANNEL)
+ * instead, as the earlier fixed-channel firmware did.
+ *
+ * Then a measurement every GPD_INTERVAL seconds and a Multi-Cluster
+ * Reporting GPDF when the temperature changed (BOARD_REPORT_DELTA) or after
+ * BOARD_HEARTBEAT intervals without one. Each GPDF goes out GPD_REPEAT
+ * times with the same MAC sequence number (the sink drops the duplicates),
+ * GPD_REPEAT_GAP apart. The device sleeps in PM2 between rounds and
+ * repetitions and while the DS18B20 supply settles and the sensor converts;
+ * any bounded wait that expires restarts it through the watchdog.
+ *
+ * Button (P2.0, wakes PM2): short press reports now; held 3 s (LED on)
+ * commissions; held 10 s (LED blinks) sends a Decommissioning GPDF, clears
+ * the settings and stops reporting until the next commissioning. LED: a
+ * flash per channel search attempt, 1 s on when a channel was found, three
+ * blinks when not. */
+#include "bgt1.h"
+#include "sensors.h"
+#include "settings.h"
+#include "clock.h"
+#include "timebase.h"
+#if GPD_SECURITY
+#include "aes.h"
+#endif
+
+/* The hint: the channel searched first and used when no proxy answers. */
+#ifndef GPD_CHANNEL
+#define GPD_CHANNEL 15u
+#endif
+#ifndef GPD_INTERVAL
+#define GPD_INTERVAL 60u
+#endif
+#ifndef GPD_COMMISSION_PERIOD
+#define GPD_COMMISSION_PERIOD 10u
+#endif
+#ifndef GPD_COMMISSION_ROUNDS
+#define GPD_COMMISSION_ROUNDS 12u
+#endif
+/* Channel search attempts per round (the TempMaster needs one attempt to
+ * be told by the sink, then waits up to 5 s on the hint channel) and the
+ * Sleep Timer ticks between them. */
+#ifndef GPD_SEARCH_ATTEMPTS
+#define GPD_SEARCH_ATTEMPTS 6u
+#endif
+#ifndef GPD_SEARCH_GAP
+#define GPD_SEARCH_GAP 13107UL     /* 400 ms */
+#endif
+#ifndef GPD_REPEAT
+#define GPD_REPEAT 3u
+#endif
+/* Sleep Timer ticks between repetitions: 655 is 20 ms. */
+#ifndef GPD_REPEAT_GAP
+#define GPD_REPEAT_GAP 655UL
+#endif
+/* SWRS081B Table 2: F5 is +4.5 dBm, also the highest setting of the BGT1
+ * vendor firmware's PA table (Z-Stack CC2590 table, 11 dBm). */
+#ifndef GPD_TXPOWER
+#define GPD_TXPOWER 0xf5u
+#endif
+
+/* SWRU191F 16.3 WDCTL, 4.10 SLEEPSTA, 11.2 STLOAD. */
+#define SOC_WDCTL_ADDRESS 0xc9u
+#define SOC_SLEEPSTA_ADDRESS 0x9du
+#define SOC_STLOAD_ADDRESS 0xadu
+#define WDCTL_RESET 0x0bu
+/* Factory IEEE address in the information page, LSB first (SWRU191F 2.3.3). */
+#define INFO_IEEE 0x780cu
+/* SWRU191F 23.15 command strobes, RFIRQF0.RXPKTDONE, RFIRQF1.TXDONE,
+ * FRMFILT0 (frame filtering off), RXFIFOCNT. */
+#define RFST_ISRXON 0xe3u
+#define RFST_ISTXON 0xe9u
+#define RFST_ISFLUSHRX 0xedu
+#define RFST_ISFLUSHTX 0xeeu
+#define RFST_ISRFOFF 0xefu
+#define RXPKTDONE 0x40u
+#define TXDONE 0x02u
+#define FRMFILT0 0x6180u
+#define RXFIFOCNT 0x619bu
+/* SWRU191F 23.12, 23.15: RSSISTAT.RSSI_VALID, RFRND.IRND. */
+#define RSSISTAT 0x6199u
+#define RFRND 0x61a7u
+#define FREQCTRL 0x618fu
+/* One AES block: about 10 us; generous bounds, a failure restarts. */
+#define AES_WAIT 328UL     /* 10 ms */
+#define AES_POLLS 4000u
+/* SWRU191F 7.12 OBSSELx (EN | rfc_obs_sig0/1), 23.15 RFC_OBS_CTRLx
+ * (inverted pa_pd / lna_pd): the Z-Stack CC2590/CC2591 front end control. */
+#define RFC_OBS_CTRL0 0x61ebu
+#define RFC_OBS_CTRL1 0x61ecu
+#define OBSSEL1 0x6244u
+#define OBSSEL4 0x6247u
+#define PA_PD_INV 0x68u
+#define LNA_PD_INV 0x6au
+#define OBS_SIG0 0xfbu
+#define OBS_SIG1 0xfcu
+/* SWRU191F 7.10 port 2 interrupt: PICTL.P2ICONL falling edge, IEN2.P2IE. */
+#define P2ICONL 0x08u
+#define P2IE 0x02u
+#define SECOND 32768UL
+/* DS18B20 supply settling, asleep. */
+#define WARMUP 328UL       /* 10 ms */
+#define TX_WAIT 164UL      /* 5 ms per GPDF (about 1.6 ms on air) */
+#define LED_ON 655UL       /* 20 ms flash */
+#define BLINK 4915UL       /* 150 ms */
+#define SPIN_WAIT 4096UL   /* 125 ms for clock and Sleep Timer handshakes */
+/* Receive window after the start of the last Channel Request: the
+ * TempMaster answers 20..25 ms after it (gpTxOffset, gpMaxTxOffsetVariation)
+ * within gpTxDuration (10 ms). */
+#define RX_OPEN 590UL      /* 18 ms */
+#define RX_CLOSE 1311UL    /* 40 ms */
+#define RX_FRAME 164UL     /* 5 ms for a frame being received to complete */
+#define BUTTON_DEBOUNCE 655UL           /* 20 ms */
+#define BUTTON_POLL 1638UL              /* 50 ms */
+#define BUTTON_COMMISSION (3UL*SECOND)
+#define BUTTON_RESET (10UL*SECOND)
+#define BUTTON_STUCK (20UL*SECOND)
+#define SLEEP_MIN 8UL
+/* SWRU191F 4.1 SLEEPCMD.MODE with OSC_PD (unused 16-MHz RCOSC off):
+ * PM2, or PM0 where PCON.IDLE only halts the CPU. */
+#define SLEEP_PM2 0x06u
+#define SLEEP_IDLE 0x04u
+
+/* Read by a debugger: progress and the last failure. */
+typedef struct {
+    uint8_t stage, failure, rounds, seq;
+    uint16_t sent, lost;
+    uint8_t src[4];
+    uint8_t channel, sensors, found, presses;
+} gpd_status_t;
+MCU_XDATA gpd_status_t gpd_status;
+
+static MCU_XDATA uint8_t frame[GPD_FRAME_LENGTH], ieee[8], rx[128];
+static MCU_XDATA uint8_t paired, armed;
+static MCU_XDATA gpd_values_t values;
+static MCU_XDATA settings_t settings;
+static MCU_XDATA clock_diagnostics_t clock_diagnostics;
+static MCU_XDATA uint32_t deadline, mark;
+static volatile MCU_XDATA uint16_t polls;
+/* Sum of the raw VDD/3 readings taken at the end of each of the last
+ * report's transmissions, and their count. */
+static MCU_XDATA uint16_t loaded;
+static MCU_XDATA uint8_t loading, loads;
+/* The temperature last reported and the intervals since. */
+static MCU_XDATA int16_t reported;
+static MCU_XDATA uint8_t quiet;
+#if GPD_SECURITY
+/* The next security frame counter. */
+static MCU_XDATA uint32_t counter;
+static MCU_XDATA aes_diagnostics_t aes_diagnostics;
+#endif
+#define S gpd_status
+#define NOW() timebase_read_awake_ticks24()
+#define SINCE(start) ((NOW()-(start))&TIMEBASE_TICKS_MASK)
+#define LATER(ticks) ((NOW()+(ticks))&TIMEBASE_TICKS_MASK)
+#define BUTTON_DOWN() (!(MMIO_READ(SOC_P2) & BOARD_BUTTON))
+
+/* Never taken in a correct sequence: the instruction after the wake clears
+ * EA before the vector can run (SWRU191F 4.2). Leaves that only clear the
+ * Sleep Timer flag (STIF) and the button flags (P2IFG.0, then P2IF). */
+__attribute__((interrupt(5))) MCU_COMMON_CODE void gpd_sleep_isr(void)
+{
+    __asm__ volatile("clr 0xc7");
+}
+
+__attribute__((interrupt(6))) MCU_COMMON_CODE void gpd_button_isr(void)
+{
+    __asm__ volatile("anl 0x8b,#0xfe\n\tclr 0xe8");
+}
+
+__attribute__((noinline)) static void restart(uint8_t failure)
+{
+    S.failure = failure;
+    MMIO_CLEAR(SOC_IEN0, 0x80);
+    MMIO_WRITE(SOC_RFST, RFST_ISRFOFF);
+    MMIO_WRITE(SOC_WDCTL, WDCTL_RESET);
+    for (;;) {}
+}
+
+/* A press counts once the button was seen released (a stuck or still held
+ * button is not a new press). */
+static uint8_t pressed(void)
+{
+    if (!BUTTON_DOWN()) {
+        armed = 1;
+        return 0;
+    }
+    return armed;
+}
+
+static void led(uint8_t on)
+{
+    if (on) MMIO_SET(SOC_P0, BOARD_LED);
+    else MMIO_CLEAR(SOC_P0, BOARD_LED);
+}
+
+/* SWRU191F 23.15: the cc2530-zigbee radio profile (radio_autoack.c),
+ * AUTOCRC without AUTOACK, no frame filtering, then channel and power. */
+static void radio_setup(uint8_t channel)
+{
+    MMIO_WRITE(SOC_RFST, RFST_ISRFOFF);
+    MMIO_XWRITE(FRMFILT0, 0x0c);
+    MMIO_XWRITE(0x6189u, 0x40);   /* FRMCTRL0 */
+    MMIO_XWRITE(0x61b2u, 0x15);   /* AGCCTRL1 */
+    MMIO_XWRITE(0x61fau, 0x09);   /* TXFILTCFG */
+    MMIO_XWRITE(0x61aeu, 0x00);   /* FSCAL1 */
+    MMIO_XWRITE(0x6191u, 0x69);   /* TXCTRL */
+    MMIO_XWRITE(0x618fu, 11u + 5u*(channel-11u));   /* FREQCTRL */
+    MMIO_XWRITE(0x6190u, GPD_TXPOWER);
+    /* PA_EN (P1.1) and LNA_EN (P1.4) follow the radio. The observation
+     * outputs do not survive PM2 (SWRU191F 7.12), so every setup sets them;
+     * without them both pins are the low GPIO outputs of bgt1_startup:
+     * front end off. */
+    MMIO_XWRITE(RFC_OBS_CTRL0, PA_PD_INV);
+    MMIO_XWRITE(OBSSEL1, OBS_SIG0);
+    MMIO_XWRITE(RFC_OBS_CTRL1, LNA_PD_INV);
+    MMIO_XWRITE(OBSSEL4, OBS_SIG1);
+}
+
+/* STIF clear; IEN0 = EA|STIE, then PCON.IDLE whose successor must not start
+ * on a 4-byte boundary (SWRU191F 4.2); clr EA runs before any ISR. */
+__attribute__((noinline)) MCU_COMMON_CODE static void enter_pm2(void)
+{
+    __asm__ volatile("clr 0xc7\n\t.p2align 2\n\tmov 0xa8,#0xa0\n\tmov 0x87,#1\n\tclr 0xaf" ::: "memory");
+}
+
+#define SPIN(condition, code) do { mark = NOW(); \
+    while (condition) if (SINCE(mark) >= SPIN_WAIT) restart(code); } while (0)
+
+/* Until a positive 32-kHz edge after a PM2 wake the Sleep Timer still reads
+ * its value from before the sleep (SWRU191F 11.4), so a SPIN deadline there
+ * expired at once after a 10 s or 60 s sleep and restarted every report.
+ * These waits are bounded by a poll count instead (as join_smoke). */
+#define POLL(condition, code) do { polls = 0; \
+    while (condition) if (!++polls) restart(code); } while (0)
+
+#if GPD_SECURITY
+/* Interrupts are off outside sleep_until (IEN0 = 0). */
+void gpd_aes(const uint8_t MCU_XDATA *key, uint8_t MCU_XDATA *block)
+{
+    if (aes128_encrypt_block((const MCU_GENERIC uint8_t *)key, (const MCU_GENERIC uint8_t *)block, block,
+                             AES_WAIT, AES_POLLS, &aes_diagnostics) != AES_OK)
+        restart(10);
+}
+
+/* A security frame counter, the lease extended in flash first. */
+static uint32_t take(void)
+{
+    if ((uint16_t)(counter >> 10) >= settings.lease) {
+        settings.lease = (uint16_t)((counter >> 10) + 1u);
+        settings_save(&settings);
+    }
+    return counter++;
+}
+
+/* A new key (SWRU191F 23.12): receiver on below the band (FREQCTRL 0, as
+ * the guide's procedure) until RSSI is valid, 1024 RFRND.IRND bits XORed
+ * into 16 bytes, which then key AES over the IEEE address and Sleep Timer
+ * as a whitening step. */
+static void generate_key(void)
+{
+    uint16_t i;
+    uint8_t MCU_XDATA *pool = rx, MCU_XDATA *block = rx + 16;
+    radio_setup(GPD_CHANNEL);
+    MMIO_XWRITE(FREQCTRL, 0);
+    for (i = 0; i < 32u; i++) rx[i] = 0;
+    MMIO_WRITE(SOC_RFST, RFST_ISRXON);
+    SPIN(!(MMIO_XREAD(RSSISTAT) & 1u), 9);
+    for (i = 0; i < 1024u; i++)
+        pool[(i >> 3) & 15u] ^= (uint8_t)((MMIO_XREAD(RFRND) & 1u) << (i & 7u));
+    MMIO_WRITE(SOC_RFST, RFST_ISRFOFF);
+    for (i = 0; i < 8u; i++) block[i] = ieee[i];
+    block[8] = MMIO_READ(SOC_ST0); block[9] = MMIO_READ(SOC_ST1); block[10] = MMIO_READ(SOC_ST2);
+    block[11] = S.seq;
+    gpd_aes(pool, block);
+    for (i = 0; i < 16u; i++) settings.key[i] = block[i];
+    settings.keyed = 0xffu;
+    settings_save(&settings);
+}
+#define SECURE(n) gpd_secure(frame, (n), settings.key, take())
+#else
+#define SECURE(n) (n)
+#endif
+
+/* PM2 (or CPU idle) until the Sleep Timer reaches wake (as cc2530-zigbee
+ * join_smoke_sleep: compare ST2, ST1, ST0 after STLOAD; after PM2 the XOSC
+ * back, then a fresh 32-kHz edge). A wake too close ends in a busy wait; a
+ * button wake sleeps again, or with on_button returns 1 for a press. */
+static uint8_t sleep_until(uint32_t wake, uint8_t mode, uint8_t on_button)
+{
+    uint32_t left;
+    for (;;) {
+        S.stage = 4;
+        left = (wake-NOW())&TIMEBASE_TICKS_MASK;
+        if (left >= TIMEBASE_TICKS_MASK/2u) return 0;
+        if (on_button && pressed()) return 1;
+        if (left <= SLEEP_MIN*2u) continue;
+        SPIN(!(MMIO_READ(SOC_STLOAD) & 1u), 5);
+        MMIO_WRITE(SOC_ST2, (uint8_t)(wake >> 16));
+        MMIO_WRITE(SOC_ST1, (uint8_t)(wake >> 8));
+        MMIO_WRITE(SOC_ST0, (uint8_t)wake);
+        if (((wake-NOW())&TIMEBASE_TICKS_MASK) < SLEEP_MIN) continue;
+        MMIO_CLEAR(SOC_P2IFG, BOARD_BUTTON);
+        MMIO_CLEAR(SOC_IRCON2, 0x01u);
+        if (on_button && pressed()) return 1;
+        MMIO_WRITE(SOC_SLEEPCMD, mode);
+        enter_pm2();
+        MMIO_WRITE(SOC_IEN0, 0);
+        MMIO_WRITE(SOC_SLEEPCMD, SLEEP_IDLE);
+        if (mode == SLEEP_PM2) {
+            S.stage = 5;
+            POLL(MMIO_READ(SOC_CLKCONSTA) != MMIO_READ(SOC_CLKCONCMD), 6);
+            POLL(MMIO_READ(SOC_SLEEPSTA) & 1u, 7);
+            POLL(!(MMIO_READ(SOC_SLEEPSTA) & 1u), 8);
+        }
+    }
+}
+
+static void nap(uint32_t ticks, uint8_t mode)
+{
+    (void)sleep_until(LATER(ticks), mode, 0);
+}
+
+static void blink(uint8_t n)
+{
+    while (n--) {
+        led(1); nap(BLINK, SLEEP_PM2);
+        led(0); nap(BLINK, SLEEP_PM2);
+    }
+}
+
+/* DS18B20 supply on and settled, conversion started, battery ADC, PM2
+ * until the conversion is done (polled after tCONV; none after the
+ * timeout), supply off. The temperature is the DS18B20's, or invalid
+ * without a valid reading. With detect, sensors that answer join
+ * S.sensors. */
+static void sample(uint8_t detect)
+{
+    uint16_t wait;
+    uint8_t ds;
+    uint32_t started;
+    S.stage = 2;
+    bgt1_power(1);
+    nap(WARMUP, SLEEP_PM2);
+    if (detect) S.sensors |= sensors_detect();
+    ds = (S.sensors & GPD_HAS_DS18B20) && ds18b20_start();
+    started = NOW();
+    bgt1_measure(&values);
+    if (loads) bgt1_battery(&values, loaded / loads);
+    for (wait = DS18B20_CONVERSION; ds; wait += DS18B20_POLL) {
+        (void)sleep_until((started + wait) & TIMEBASE_TICKS_MASK, SLEEP_PM2, 0);
+        if (!ds18b20_busy()) break;
+        if (wait >= DS18B20_TIMEOUT) ds = 0;
+    }
+    if (ds) ds18b20_read(&values);
+    bgt1_power(0);
+}
+
+/* One GPDF: TX FIFO length (with FCS) and body, ISTXON (calibrates, then
+ * sends without CCA), TXDONE, radio off. */
+static void transmit(uint8_t length)
+{
+    uint16_t vdd, last = BGT1_INVALID_U16;
+    uint8_t i;
+    MMIO_WRITE(SOC_RFST, RFST_ISFLUSHTX);
+    MMIO_WRITE(SOC_RFD, length + 2u);
+    for (i = 0; i < length; i++) MMIO_WRITE(SOC_RFD, frame[i]);
+    MMIO_WRITE(SOC_RFIRQF1, (uint8_t)~TXDONE);
+    MMIO_WRITE(SOC_RFST, RFST_ISTXON);
+    mark = NOW();
+    /* With the bulk capacitor VDD sags most at the end of the frame: keep
+     * the last VDD conversion (about 0.13 ms) that ends before TXDONE. */
+    while (!(MMIO_READ(SOC_RFIRQF1) & TXDONE)) {
+        if (SINCE(mark) >= TX_WAIT) break;
+        if (loading) {
+            vdd = bgt1_vdd();
+            if (!(MMIO_READ(SOC_RFIRQF1) & TXDONE)) last = vdd;
+        }
+    }
+    if (MMIO_READ(SOC_RFIRQF1) & TXDONE) {
+        S.sent++;
+        if (last <= BGT1_ADC_MAX) {
+            loaded += last;
+            loads++;
+        }
+    } else S.lost++;
+    MMIO_WRITE(SOC_RFIRQF1, (uint8_t)~TXDONE);
+    MMIO_WRITE(SOC_RFST, RFST_ISRFOFF);
+}
+
+/* One GPDF GPD_REPEAT times; PM2 between repetitions, then the radio
+ * profile again. */
+static void send(uint8_t length)
+{
+    uint8_t r;
+    for (r = 0; r < GPD_REPEAT; r++) {
+        if (r) {
+            nap(GPD_REPEAT_GAP, SLEEP_PM2);
+            radio_setup(S.channel);
+        }
+        transmit(length);
+    }
+    S.seq++;
+}
+
+/* Receive from RX_OPEN to RX_CLOSE after start: the operational channel of
+ * a Channel Configuration with a good FCS, or 0. */
+static uint8_t listen(uint32_t start)
+{
+    uint8_t found = 0, n, i;
+    nap((RX_OPEN - SINCE(start)) & TIMEBASE_TICKS_MASK, SLEEP_IDLE);
+    MMIO_WRITE(SOC_RFST, RFST_ISFLUSHRX);
+    MMIO_WRITE(SOC_RFST, RFST_ISFLUSHRX);
+    MMIO_WRITE(SOC_RFIRQF0, (uint8_t)~RXPKTDONE);
+    MMIO_WRITE(SOC_RFST, RFST_ISRXON);
+    while (!found && SINCE(start) < RX_CLOSE) {
+        if (!(MMIO_READ(SOC_RFIRQF0) & RXPKTDONE)) continue;
+        MMIO_WRITE(SOC_RFIRQF0, (uint8_t)~RXPKTDONE);
+        while (!found && MMIO_XREAD(RXFIFOCNT)) {
+            n = MMIO_READ(SOC_RFD) & 0x7fu;
+            mark = NOW();
+            while (MMIO_XREAD(RXFIFOCNT) < n)
+                if (SINCE(mark) >= RX_FRAME) break;
+            if (!n || MMIO_XREAD(RXFIFOCNT) < n) {
+                MMIO_WRITE(SOC_RFST, RFST_ISFLUSHRX);
+                MMIO_WRITE(SOC_RFST, RFST_ISFLUSHRX);
+                break;
+            }
+            for (i = 0; i < n; i++) rx[i] = MMIO_READ(SOC_RFD);
+            if (rx[n-1u] & 0x80u) found = gpd_channel_configuration(rx, n);
+        }
+    }
+    MMIO_WRITE(SOC_RFST, RFST_ISRFOFF);
+    MMIO_WRITE(SOC_RFST, RFST_ISFLUSHRX);
+    MMIO_WRITE(SOC_RFST, RFST_ISFLUSHRX);
+    return found;
+}
+
+/* GPD_SEARCH_ATTEMPTS Channel Request bursts announcing hint as the receive
+ * channel: Auto-Commissioning 1 on every other channel, 0 on hint, then the
+ * receive window there. The found channel, or 0. */
+static uint8_t search(uint8_t hint)
+{
+    uint8_t attempt, channel, found;
+    uint32_t start;
+    for (attempt = 0; attempt < GPD_SEARCH_ATTEMPTS; attempt++) {
+        if (attempt) nap(GPD_SEARCH_GAP, SLEEP_PM2);
+        led(1);
+        for (channel = 11u; channel <= 26u; channel++) {
+            if (channel == hint) continue;
+            radio_setup(channel);
+            transmit(gpd_channel_request(frame, S.seq++, 1, hint));
+        }
+        radio_setup(hint);
+        start = NOW();
+        transmit(gpd_channel_request(frame, S.seq++, 0, hint));
+        found = listen(start);
+        led(0);
+        if (found) return found;
+    }
+    return 0;
+}
+
+/* The battery is also read at the end of the report's transmissions; their
+ * average (VDD under TX load) becomes the next report's battery. */
+static void report(void)
+{
+    radio_setup(S.channel);
+    loaded = 0;
+    loads = 0;
+    loading = 1;
+    send(SECURE(gpd_report(frame, S.seq, S.src, &values)));
+    loading = 0;
+    reported = values.temperature;
+    quiet = 0;
+}
+
+/* Rounds of search, then commissioning and a report; the channel found is
+ * saved with the sensor set. A button press ends the rounds. */
+static void commission(void)
+{
+    uint8_t hint = settings.channel ? settings.channel : GPD_CHANNEL, found = 0;
+#if GPD_SECURITY
+    if (settings.keyed != 0xffu) generate_key();
+#endif
+    sample(1);
+    for (S.rounds = 0; S.rounds < GPD_COMMISSION_ROUNDS && !found; ) {
+        S.rounds++;
+        deadline = LATER((uint32_t)GPD_COMMISSION_PERIOD*SECOND);
+        found = search(hint);
+        S.channel = found ? found : hint;
+        radio_setup(S.channel);
+        led(1);
+#if GPD_SECURITY
+        send(gpd_commissioning(frame, S.seq, S.src, S.sensors, settings.key, take()));
+#else
+        send(gpd_commissioning(frame, S.seq, S.src, S.sensors));
+#endif
+        nap(GPD_REPEAT_GAP, SLEEP_PM2);
+        report();
+        led(0);
+        if (!found && S.rounds < GPD_COMMISSION_ROUNDS && sleep_until(deadline, SLEEP_PM2, 1)) break;
+    }
+    if (found) {
+        S.found++;
+        settings.channel = found;
+        led(1); nap(SECOND, SLEEP_PM2); led(0);
+    } else {
+        blink(3);
+    }
+    settings.sensors = S.sensors;
+    settings_save(&settings);
+    paired = 1;
+    deadline = LATER((uint32_t)GPD_INTERVAL*SECOND);
+}
+
+static void decommission(void)
+{
+    radio_setup(S.channel);
+    send(SECURE(gpd_decommissioning(frame, S.seq, S.src)));
+    settings_clear();
+    settings.channel = settings.sensors = 0;
+#if GPD_SECURITY
+    /* The key goes; the counters stay used. */
+    settings.keyed = 0;
+    settings_save(&settings);
+#endif
+    S.sensors = 0;
+    paired = 0;
+    blink(5);
+}
+
+/* After debouncing: LED on from 3 s, blinking from 10 s; the action on
+ * release. A press held over 20 s is ignored. */
+static void button(void)
+{
+    uint32_t down;
+    uint8_t level = 0;
+    armed = 0;
+    nap(BUTTON_DEBOUNCE, SLEEP_IDLE);
+    if (!BUTTON_DOWN()) return;
+    S.presses++;
+    down = NOW();
+    while (BUTTON_DOWN()) {
+        if (SINCE(down) >= BUTTON_STUCK) { led(0); return; }
+        if (SINCE(down) >= BUTTON_RESET) { level = 2; led(!(MMIO_READ(SOC_P0) & BOARD_LED)); }
+        else if (SINCE(down) >= BUTTON_COMMISSION) { level = 1; led(1); }
+        nap(BUTTON_POLL, SLEEP_PM2);
+    }
+    led(0);
+    armed = 1;
+    if (level == 2) {
+        decommission();
+    } else if (level == 1) {
+        commission();
+    } else if (paired) {
+        sample(0);
+        report();
+        led(1); nap(LED_ON, SLEEP_PM2); led(0);
+    }
+}
+
+void main(void)
+{
+    uint8_t i;
+    bgt1_startup();
+    S.stage = 1;
+    if (clock_select_init(CLOCK_XOSC32, 1024, 4096, &clock_diagnostics) != CLOCK_OK) restart(1);
+    MMIO_SET(SOC_PICTL, P2ICONL);
+    MMIO_SET(SOC_P2IEN, BOARD_BUTTON);
+    MMIO_SET(SOC_IEN2, P2IE);
+    for (i = 0; i < 8u; i++) ieee[i] = MMIO_XREAD(INFO_IEEE + i);
+    gpd_source(S.src, ieee);
+    S.seq = (uint8_t)(ieee[0] ^ MMIO_READ(SOC_ST0));
+    settings_load(&settings);
+#if GPD_SECURITY
+    counter = (uint32_t)settings.lease << 10;
+#endif
+    S.sensors = settings.sensors;
+    S.channel = settings.channel ? settings.channel : GPD_CHANNEL;
+    sample(1);
+#if GPD_SECURITY
+    if (!settings.channel || S.sensors != settings.sensors || settings.keyed != 0xffu) {
+#else
+    if (!settings.channel || S.sensors != settings.sensors) {
+#endif
+        commission();
+    } else {
+        paired = 1;
+        report();
+        deadline = LATER((uint32_t)GPD_INTERVAL*SECOND);
+    }
+    for (;;) {
+        if (sleep_until(deadline, SLEEP_PM2, 1)) {
+            button();
+            continue;
+        }
+        if (paired) {
+            sample(0);
+            if (gpd_temperature_changed(values.temperature, reported, BOARD_REPORT_DELTA) ||
+                ++quiet >= BOARD_HEARTBEAT)
+            report();
+        }
+        deadline = (deadline + (uint32_t)GPD_INTERVAL*SECOND) & TIMEBASE_TICKS_MASK;
+    }
+}
