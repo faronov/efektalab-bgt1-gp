@@ -2,8 +2,10 @@
 
 The GPD commissions with DeviceID 0x30 (TemperatureSensor), manufacturer 0x6D6B and
 model 0xF200 | sensors (bit 1: DS18B20), then sends level-3 secured Multi-Cluster Reporting
-(0xA2) frames with the DS18B20 temperature (0x0402), battery voltage (0x0001/0x0020)
-and battery remaining (0x0001/0x0021) in their ZCL encodings.
+(0xA2) frames with the DS18B20 temperature (0x0402), battery voltage (0x0001/0x0020),
+battery remaining (0x0001/0x0021) in their ZCL encodings and, in newer builds, the
+battery voltage in millivolts as Electrical Measurement DCVoltage (0x0B04/0x0100).
+Every report refreshes the entities, also when the values did not change.
 Copy to <HA config>/custom_zha_quirks/ (requires ZHA with Green Power support).
 """
 
@@ -11,8 +13,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from zha.application.platforms import EntityStateChangedEvent
 from zha.application.platforms.sensor import BaseSensor
 from zha.application.platforms.sensor.const import SensorDeviceClass, SensorStateClass
+from zha.const import STATE_CHANGED
 from zha.units import PERCENTAGE, UnitOfElectricPotential, UnitOfTemperature
 from zigpy.device import GreenPowerCommandReceived
 from zigpy.zgp.types import DeviceID, GPDCommandID
@@ -25,12 +29,10 @@ BGT1_GP_HAS_DS18B20 = 0x02
 
 
 class Bgt1GreenPowerSensor(BaseSensor):
-    """Sensor updated from one ZCL attribute in the GPD attribute reports."""
+    """Sensor updated from ZCL attributes in the GPD attribute reports."""
 
-    _cluster_id: int
-    _attribute_id: int
-    _invalid: int
-    _scale: int
+    # (cluster, attribute, invalid raw value, divisor), the first one present wins.
+    _sources: tuple[tuple[int, int, int, int], ...]
     _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, device: Any, **kwargs: Any) -> None:
@@ -61,17 +63,29 @@ class Bgt1GreenPowerSensor(BaseSensor):
             records = [(event.command.cluster_id, a) for a in event.command.attributes]
         else:
             return
-        for cluster_id, attribute in records:
-            if cluster_id == self._cluster_id and attribute.attrid == self._attribute_id:
-                raw = attribute.value.value
-                self._value = None if raw == self._invalid else raw / self._scale
-                self.maybe_emit_state_changed_event()
+        values = {(c, a.attrid): a.value.value for c, a in records}
+        for cluster_id, attribute_id, invalid, divisor in self._sources:
+            if (raw := values.get((cluster_id, attribute_id))) is not None:
+                before = self.state
+                self._value = None if raw == invalid else raw / divisor
+                self._report(unchanged=self.state == before)
+                return
+
+    def _report(self, unchanged: bool) -> None:
+        """Emit the state for every report, so Home Assistant sees the device alive."""
+        self.maybe_emit_state_changed_event()
+        if not unchanged:
+            return
+        self.emit(
+            STATE_CHANGED,
+            EntityStateChangedEvent(**self.identifiers.__dict__, state_diff={}),
+        )
 
 
 class Bgt1Temperature(Bgt1GreenPowerSensor):
     """DS18B20 temperature (0x0402 MeasuredValue, 0.01 °C)."""
 
-    _cluster_id, _attribute_id, _invalid, _scale = 0x0402, 0x0000, -0x8000, 100
+    _sources = ((0x0402, 0x0000, -0x8000, 100),)
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_suggested_display_precision = 1
@@ -80,19 +94,19 @@ class Bgt1Temperature(Bgt1GreenPowerSensor):
 class Bgt1Battery(Bgt1GreenPowerSensor):
     """Battery remaining (0x0001 BatteryPercentageRemaining, 0.5 %)."""
 
-    _cluster_id, _attribute_id, _invalid, _scale = 0x0001, 0x0021, 0xFF, 2
+    _sources = ((0x0001, 0x0021, 0xFF, 2),)
     _attr_device_class = SensorDeviceClass.BATTERY
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_suggested_display_precision = 0
 
 
 class Bgt1BatteryVoltage(Bgt1GreenPowerSensor):
-    """Battery voltage (0x0001 BatteryVoltage, 100 mV)."""
+    """Battery voltage: 0x0B04 DCVoltage in mV, else 0x0001 BatteryVoltage (100 mV)."""
 
-    _cluster_id, _attribute_id, _invalid, _scale = 0x0001, 0x0020, 0xFF, 10
+    _sources = ((0x0B04, 0x0100, -0x8000, 1000), (0x0001, 0x0020, 0xFF, 10))
     _attr_device_class = SensorDeviceClass.VOLTAGE
     _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
-    _attr_suggested_display_precision = 1
+    _attr_suggested_display_precision = 2
 
 
 for _sensors in (0, BGT1_GP_HAS_DS18B20):

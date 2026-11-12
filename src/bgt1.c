@@ -57,19 +57,27 @@ static uint16_t adc(uint8_t command, uint8_t n)
     return (uint16_t)(sum / n);
 }
 
-/* Two alkaline AAA cells at the end of a TX burst, 0.5 % units. A rough
- * piecewise fit of the AAA discharge curve under a light load, 1.0 V per
- * cell as empty; approximate. */
+/* Two alkaline AAA cells at the end of a TX burst, 0.5 % units: linear
+ * between the points of an approximate alkaline discharge curve, about
+ * 1.58 V per cell full and 1.0 V (the CC2530's 2.0 V minimum) empty. */
+static const MCU_CODE uint16_t curve_mv[] = {3150u, 3000u, 2800u, 2600u, 2400u, 2200u, 2000u};
+static const MCU_CODE uint8_t curve_half_percent[] = {200u, 170u, 124u, 80u, 44u, 16u, 0u};
+
 static uint8_t percent(uint16_t mv)
 {
-    uint16_t p;
-    if (mv >= 2900u) p = 100;
-    else if (mv > 2600u) p = 75u + (mv-2600u)*25u/300u;
-    else if (mv > 2400u) p = 50u + (mv-2400u)*25u/200u;
-    else if (mv > 2200u) p = 20u + (mv-2200u)*30u/200u;
-    else if (mv > 2000u) p = (mv-2000u)*20u/200u;
-    else p = 0;
-    return (uint8_t)(p*2u);
+    uint8_t i, high, low;
+    uint16_t top, bottom;
+    if (mv >= curve_mv[0]) return curve_half_percent[0];
+    for (i = 1; i < sizeof(curve_mv) / sizeof(curve_mv[0]); i++) {
+        bottom = curve_mv[i];
+        if (mv > bottom) {
+            top = curve_mv[i-1u];
+            high = curve_half_percent[i-1u];
+            low = curve_half_percent[i];
+            return (uint8_t)(low + (uint16_t)(mv - bottom) * (uint8_t)(high - low) / (uint16_t)(top - bottom));
+        }
+    }
+    return 0;
 }
 
 uint16_t bgt1_vdd(void)
@@ -82,9 +90,11 @@ void bgt1_battery(gpd_values_t MCU_XDATA *v, uint16_t raw)
     uint16_t mv;
     if (raw > BGT1_ADC_MAX) {
         v->voltage = v->percent = 0xffu;
+        v->millivolts = (int16_t)BGT1_INVALID_S16;
         return;
     }
     mv = BGT1_MILLIVOLTS(raw);
+    v->millivolts = (int16_t)mv;
     v->voltage = (uint8_t)((mv+50u)/100u);
     v->percent = percent(mv);
 }

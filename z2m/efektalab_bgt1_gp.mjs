@@ -10,6 +10,8 @@
 //   0x0402/0x0000 int16  temperature, 0.01 C, 0x8000 invalid
 //   0x0001/0x0020 uint8  battery voltage, 100 mV, 0xFF invalid
 //   0x0001/0x0021 uint8  battery remaining, 0.5 %, 0xFF invalid
+//   0x0B04/0x0100 int16  battery voltage, 1 mV, 0x8000 invalid (newer builds;
+//                        preferred over 0x0001/0x0020 when present)
 import * as exposes from "zigbee-herdsman-converters/lib/exposes";
 import {hasAlreadyProcessedMessage} from "zigbee-herdsman-converters/lib/utils";
 
@@ -38,8 +40,11 @@ const fzReport = {
         if (typeof temperature === "number" && temperature !== -0x8000) {
             result.temperature = temperature / 100;
         }
+        const millivolts = value(reports, 0x0b04, 0x0100, "dcVoltage");
         const voltage = value(reports, 0x0001, 0x0020, "batteryVoltage");
-        if (typeof voltage === "number" && voltage !== 0xff) {
+        if (typeof millivolts === "number" && millivolts !== -0x8000) {
+            result.voltage = millivolts;
+        } else if (typeof voltage === "number" && voltage !== 0xff) {
             result.voltage = voltage * 100;
         }
         const percent = value(reports, 0x0001, 0x0021, "batteryPercentageRemaining");

@@ -20,8 +20,10 @@ Split from the `BOARD=bgt1` build of
   DS18B20 is detected at every start.
 - Battery: read at the end of the report's transmissions (under TX load)
   and reported in the next one; the first report after a start uses the idle
-  voltage. 0 % at 2.0 V, 100 % from 2.9 V, a rough piecewise curve for two
-  alkaline AAA cells; approximate.
+  voltage. Reported in 1 mV and, for standard sinks, 100 mV steps. The
+  percentage is linear between points of an approximate discharge curve
+  for two alkaline AAA cells: 100 % from 3.15 V, 85 % at 3.0 V, 62 % at
+  2.8 V, 40 % at 2.6 V, 22 % at 2.4 V, 8 % at 2.2 V and 0 % at 2.0 V.
 
 ## Hardware
 
@@ -50,11 +52,14 @@ CC2590, more with a CC2591). Which of the two is fitted is not known.
   values.
 - Commissioning frame (0xE0): DeviceID 0x30 (TemperatureSensor),
   manufacturer 0x6D6B, model 0xF202 (`0xF200 | sensors`, bit 1 DS18B20;
-  0xF200 when no DS18B20 answers). Server clusters are 0x0001 and 0x0402.
+  0xF200 when no DS18B20 answers). Server clusters are 0x0001, 0x0402 and 0x0B04.
 - Reports: a Multi-Cluster Reporting frame (0xA2) with, in their ZCL
   encodings:
   - temperature (0x0402), 0x8000 when invalid;
-  - battery voltage (0x0001/0x0020) and battery remaining (0x0001/0x0021).
+  - battery voltage (0x0001/0x0020) and battery remaining (0x0001/0x0021);
+  - battery voltage in millivolts as Electrical Measurement DCVoltage
+    (0x0B04/0x0100, int16, 0x8000 when invalid). The GPD reports no
+    DCVoltageMultiplier/DCVoltageDivisor; the scale is fixed at 1 mV.
 - Change-based reporting: the sensor wakes every 60 s (`GPD_INTERVAL`) but
   transmits only when the temperature moved by 0.25 °C or more from the last
   report, became valid or invalid, or after 30 minutes without a report
