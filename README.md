@@ -20,8 +20,9 @@ Split from the `BOARD=bgt1` build of
   DS18B20 is detected at every start.
 - Battery: read at the end of the report's transmissions (under TX load)
   and reported in the next one; the first report after a start uses the idle
-  voltage. 0 % at 2.0 V, 100 % from 2.9 V, a rough piecewise curve for two
-  alkaline AAA cells; approximate.
+  voltage, in 100 mV steps. The percentage is linear between points of an
+  approximate discharge curve for two alkaline AAA cells: 100 % from 3.15 V, 85 % at 3.0 V, 62 % at
+  2.8 V, 40 % at 2.6 V, 22 % at 2.4 V, 8 % at 2.2 V and 0 % at 2.0 V.
 
 ## Hardware
 

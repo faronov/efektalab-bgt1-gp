@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from zha.const import STATE_CHANGED
 from zha.quirks import DEVICE_REGISTRY
 from zigpy.device import GreenPowerCommandReceived, GreenPowerDevice
 from zigpy.zgp.commands import GPCommissioningPayload, GPMultiClusterReportingPayload
@@ -44,12 +45,19 @@ def test_bgt1_gp_quirk(model):
 
     report, rest = GPMultiClusterReportingPayload.deserialize(REPORT)
     assert rest == b""
-    gpd.emit(
-        GreenPowerCommandReceived.event_type,
-        GreenPowerCommandReceived(
-            device_ieee="", endpoint_id=0,
-            command_id=GPDCommandID.MultiClusterReporting, command=report,
-        ),
+    event = GreenPowerCommandReceived(
+        device_ieee="", endpoint_id=0,
+        command_id=GPDCommandID.MultiClusterReporting, command=report,
     )
+    gpd.emit(GreenPowerCommandReceived.event_type, event)
     values = {name: e.native_value for name, e in entities.items()}
     assert values == {"temperature": -5.0, "battery_voltage": 3.0, "battery": 100.0}
+
+    # Every report emits a state event, also with unchanged values.
+    events = {name: [] for name in entities}
+    for name, entity in entities.items():
+        entity.on_event(STATE_CHANGED, events[name].append)
+    gpd.emit(GreenPowerCommandReceived.event_type, event)
+    assert {name: len(e) for name, e in events.items()} == {
+        "temperature": 1, "battery_voltage": 1, "battery": 1
+    }

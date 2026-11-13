@@ -4,6 +4,7 @@ The GPD commissions with DeviceID 0x30 (TemperatureSensor), manufacturer 0x6D6B 
 model 0xF200 | sensors (bit 1: DS18B20), then sends level-3 secured Multi-Cluster Reporting
 (0xA2) frames with the DS18B20 temperature (0x0402), battery voltage (0x0001/0x0020)
 and battery remaining (0x0001/0x0021) in their ZCL encodings.
+Every report refreshes the entities, also when the values did not change.
 Copy to <HA config>/custom_zha_quirks/ (requires ZHA with Green Power support).
 """
 
@@ -11,8 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from zha.application.platforms import EntityStateChangedEvent
 from zha.application.platforms.sensor import BaseSensor
 from zha.application.platforms.sensor.const import SensorDeviceClass, SensorStateClass
+from zha.const import STATE_CHANGED
 from zha.units import PERCENTAGE, UnitOfElectricPotential, UnitOfTemperature
 from zigpy.device import GreenPowerCommandReceived
 from zigpy.zgp.types import DeviceID, GPDCommandID
@@ -64,8 +67,19 @@ class Bgt1GreenPowerSensor(BaseSensor):
         for cluster_id, attribute in records:
             if cluster_id == self._cluster_id and attribute.attrid == self._attribute_id:
                 raw = attribute.value.value
+                before = self.state
                 self._value = None if raw == self._invalid else raw / self._scale
-                self.maybe_emit_state_changed_event()
+                self._report(unchanged=self.state == before)
+
+    def _report(self, unchanged: bool) -> None:
+        """Emit the state for every report, so Home Assistant sees the device alive."""
+        self.maybe_emit_state_changed_event()
+        if not unchanged:
+            return
+        self.emit(
+            STATE_CHANGED,
+            EntityStateChangedEvent(**self.identifiers.__dict__, state_diff={}),
+        )
 
 
 class Bgt1Temperature(Bgt1GreenPowerSensor):
