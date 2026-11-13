@@ -90,11 +90,9 @@ void bgt1_battery(gpd_values_t MCU_XDATA *v, uint16_t raw)
     uint16_t mv;
     if (raw > BGT1_ADC_MAX) {
         v->voltage = v->percent = 0xffu;
-        v->millivolts = (int16_t)BGT1_INVALID_S16;
         return;
     }
     mv = BGT1_MILLIVOLTS(raw);
-    v->millivolts = (int16_t)mv;
     v->voltage = (uint8_t)((mv+50u)/100u);
     v->percent = percent(mv);
 }

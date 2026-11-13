@@ -35,7 +35,7 @@
  * after TX). Application information: manufacturer ID, model ID and the
  * server cluster list. */
 #define GPD_DEVICE_ID 0x30u
-#define GPD_SERVER_CLUSTERS 3u
+#define GPD_SERVER_CLUSTERS 2u
 #ifndef GPD_SECURITY
 #define GPD_SECURITY 1
 #endif
@@ -61,18 +61,18 @@
  * so the sink's quirk knows which values come. */
 #define GPD_HAS_DS18B20 0x02u
 /* Commissioning: device ID, options, application information,
- * manufacturer and model ID, the cluster count and three clusters (14);
- * with GPD_SECURITY also the extended options, key, key MIC and outgoing
+ * manufacturer and model ID, the cluster count and two clusters (12); with
+ * GPD_SECURITY also the extended options, key, key MIC and outgoing
  * counter. Secured frames: extended NWK frame control, security frame
- * counter, MIC. Report: four attribute records (26). */
+ * counter, MIC. Report: three attribute records (19). */
 #if GPD_SECURITY
-#define GPD_COMMISSIONING_LENGTH (GPD_HEADER + 1u + 14u + 25u)
+#define GPD_COMMISSIONING_LENGTH (GPD_HEADER + 1u + 12u + 25u)
 #define GPD_SECURITY_OVERHEAD 9u
 #else
-#define GPD_COMMISSIONING_LENGTH (GPD_HEADER + 1u + 14u)
+#define GPD_COMMISSIONING_LENGTH (GPD_HEADER + 1u + 12u)
 #define GPD_SECURITY_OVERHEAD 0u
 #endif
-#define GPD_REPORT_LENGTH (GPD_HEADER + 1u + 26u)
+#define GPD_REPORT_LENGTH (GPD_HEADER + 1u + 19u)
 #define GPD_DECOMMISSIONING_SECURED (GPD_DECOMMISSIONING_LENGTH + GPD_SECURITY_OVERHEAD)
 /* A buffer for any of the frames, secured or not. */
 #define GPD_FRAME_LENGTH (GPD_COMMISSIONING_LENGTH > GPD_REPORT_LENGTH + GPD_SECURITY_OVERHEAD ? \
@@ -82,7 +82,6 @@ typedef struct {
     int16_t temperature;     /* 0x0402/0000, 0.01 C, 0x8000 invalid */
     uint8_t voltage;         /* 0x0001/0020, 100 mV, FF invalid */
     uint8_t percent;         /* 0x0001/0021, 0.5 %, FF invalid */
-    int16_t millivolts;      /* 0x0B04/0100, mV, 0x8000 invalid */
 } gpd_values_t;
 
 /* A temperature (0.01 C, 0x8000 invalid) worth reporting against the last
@@ -221,7 +220,6 @@ __attribute__((unused)) static uint8_t gpd_commissioning(uint8_t MCU_XDATA *f, u
     f[n++] = GPD_SERVER_CLUSTERS;
     f[n++] = 0x01; f[n++] = 0x00;   /* Power Configuration */
     f[n++] = 0x02; f[n++] = 0x04;   /* Temperature Measurement */
-    f[n++] = 0x04; f[n++] = 0x0b;   /* Electrical Measurement */
     return n;
 }
 
@@ -284,10 +282,7 @@ __attribute__((unused)) static uint8_t gpd_report(uint8_t MCU_XDATA *f, uint8_t 
     uint8_t n = gpd_header(f, seq, src, GPD_MULTI_REPORT);
     n = gpd_record(f, n, 0x0402u, 0x00u, 0x29u, (uint16_t)v->temperature);
     n = gpd_record(f, n, 0x0001u, 0x20u, 0x20u, v->voltage);
-    n = gpd_record(f, n, 0x0001u, 0x21u, 0x20u, v->percent);
-    /* DCVoltage with a fixed scale of 1 mV: the GPD reports no
-     * DCVoltageMultiplier/DCVoltageDivisor. */
-    return gpd_record(f, n, 0x0b04u, 0x0100u, 0x29u, (uint16_t)v->millivolts);
+    return gpd_record(f, n, 0x0001u, 0x21u, 0x20u, v->percent);
 }
 
 #endif
